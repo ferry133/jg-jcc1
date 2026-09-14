@@ -1,0 +1,102 @@
+---
+# Runs the repo's own check scripts. Until 2026-08-31 (`#59`) nothing ran them:
+# `.github/workflows/` held zero files while `scripts/` held eighteen, so every
+# guard in here was only ever exercised by a person remembering to, and the
+# eight that `:configure:` runs are run by per-user repos against *their* copy —
+# a snapshot taken when that repo was created. The originals had no runner at
+# all.
+#
+# Two design choices worth not undoing:
+#
+# 1. **No path filter.** The obvious version only runs when `scripts/**` or
+#    `templates/**` change. `ferry133/jg-base#32` is what that costs: the filter
+#    there omitted the tests' own directory, so a PR that broke a test did not
+#    run it. More to the point, a skipped job reports green, and "skipped" and
+#    "passed" are the same colour in the checks list (`jg-base#23`/`#25`).
+#    Running always removes the failure mode instead of guarding it.
+#
+# 2. **Every check script is either RUN or SKIP, and an unclassified one is a
+#    failure.** `#58` added `check-claude-instances-default.py` with nothing to
+#    run it; that is how this repo got here, and a list nobody is forced to
+#    update would let it happen again silently.
+name: Template Checks
+
+on:
+  pull_request:
+  push:
+    branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: check scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install tools
+        uses: jdx/mise-action@v3
+        with:
+          cache: true
+
+      # The set of check scripts must equal RUN + SKIP. A new `check-*` that
+      # nobody classified fails here rather than shipping with no runner.
+      - name: Every check script is accounted for
+        run: python3 .github/workflows/ci-checks.py --audit
+
+      - name: Run the checks that do not need a cluster
+        run: python3 .github/workflows/ci-checks.py --run
+
+      # The guards above protect the templates; nothing protected the guards'
+      # own tests. `scripts/tests/` was empty from 2026-08-27 to 2026-09-12
+      # (`#104`) and no view said so — `ci-checks.py` inventories `scripts/*`
+      # files, so an empty *directory* is not in its field of vision, and
+      # `unittest discover` exits 0 when it finds nothing. The runner asserts
+      # the collected count for that reason; see its docstring.
+      #
+      # A step in THIS job on purpose, not a job of its own: `Template Checks
+      # Success` inspects `checks`, so a test failure already turns that gate
+      # red. A new job would need adding to that gate's `needs`, and a gate that
+      # silently does not cover something is the shape above.
+      #
+      # What that gate is NOT is a merge blocker, and `#110` said it was
+      # ("already covered by the required check"). Measured 2026-09-12:
+      # `gh api repos/ferry133/jg-cluster-template/branches/main/protection`
+      # returns 404 `Branch not protected`. Positive control, so the 404 is not
+      # the query being wrong: the same call on `ferry133/jg-base` returns a
+      # required `Flux Local Success`. Red here is a signal, not a door.
+      - name: Unit tests (fails if nothing was collected)
+        run: python3 .github/workflows/run-tests.py
+
+  # A separate always-running job so the gate has a stable name and a skipped or
+  # cancelled `checks` cannot report green. `needs` alone is not enough: with
+  # `if: always()` the gate must inspect the result explicitly.
+  #
+  # "Required" is what this job was designed to be, not what it is: nothing
+  # references it, because `main` in this repo has no branch protection at all
+  # (measured 2026-09-12, see the step above). Whether it becomes required is a
+  # repo setting, invisible from a clone — so a comment here claiming the name is
+  # gated would be describing a door that was never hung.
+  success:
+    name: Template Checks Success
+    if: always()
+    needs: [checks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assert the checks actually ran and passed
+        run: |
+          result='${{ needs.checks.result }}'
+          echo "checks job result: ${result}"
+          if [ "${result}" != "success" ]; then
+            echo "::error::check scripts did not succeed (result: ${result})."
+            echo "::error::'skipped' and 'cancelled' are failures here — a job that"
+            echo "::error::did not run is not a job that passed."
+            exit 1
+          fi

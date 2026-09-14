@@ -1,0 +1,317 @@
+---
+version: '3'
+
+vars:
+  MAKEJINJA_CONFIG_FILE: '{{.ROOT_DIR}}/makejinja.toml'
+  TEMPLATE_DIR: '{{.ROOT_DIR}}/templates'
+  TEMPLATE_RESOURCES_DIR: '{{.ROOT_DIR}}/.taskfiles/template/resources'
+  TEMPLATE_CONFIG_FILE: '{{.ROOT_DIR}}/cluster.yaml'
+  TEMPLATE_NODE_CONFIG_FILE: '{{.ROOT_DIR}}/nodes.yaml'
+  MERGED_CONFIG_FILE: '{{.ROOT_DIR}}/.merged-config.yaml'
+
+tasks:
+
+  :init:
+    desc: Initialize configuration files
+    cmds:
+      - task: generate-template-config
+      - task: generate-node-config
+      - task: generate-age-key
+      - task: generate-deploy-key
+      - task: generate-push-token
+
+  generate-template-config:
+    internal: true
+    cmds:
+      - mv {{.TEMPLATE_CONFIG_FILE | replace ".yaml" ".sample.yaml"}} {{.TEMPLATE_CONFIG_FILE}}
+    status:
+      - test -f {{.TEMPLATE_CONFIG_FILE}}
+
+  # makejinja aborts if a declared data file is missing, and `cue vet` needs the
+  # file before rendering. Omni-path repos never fill nodes.yaml in (and repos
+  # generated before it existed have no sample either), so materialise an empty
+  # one rather than break `task configure`.
+  generate-node-config:
+    internal: true
+    cmds:
+      - |
+        cp {{.ROOT_DIR}}/nodes.sample.yaml {{.TEMPLATE_NODE_CONFIG_FILE}} 2>/dev/null \
+          || printf 'nodes: []\n' > {{.TEMPLATE_NODE_CONFIG_FILE}}
+    status:
+      - test -f {{.TEMPLATE_NODE_CONFIG_FILE}}
+
+  generate-age-key:
+    internal: true
+    cmd: age-keygen --output {{.SOPS_AGE_KEY_FILE}}
+    status:
+      - test -f {{.SOPS_AGE_KEY_FILE}}
+    preconditions:
+      - which age-keygen
+
+  generate-deploy-key:
+    internal: true
+    cmd: ssh-keygen -t ed25519 -C "deploy-key" -f {{.ROOT_DIR}}/github-deploy.key -q -P ""
+    status:
+      - test -f {{.ROOT_DIR}}/github-deploy.key
+    preconditions:
+      - which ssh-keygen
+
+  generate-push-token:
+    internal: true
+    cmd: python -c "import secrets; print(secrets.token_hex(16))" > {{.ROOT_DIR}}/github-push-token.txt
+    status:
+      - test -f {{.ROOT_DIR}}/github-push-token.txt
+
+  :configure:
+    desc: Render and validate configuration files
+    prompt: Any conflicting files in the kubernetes directory will be overwritten... continue?
+    cmds:
+      - task: check-integrity
+      - task: check-claudecode-auth
+      - task: check-lb-pool-render
+      - task: check-forwarded-header-trust
+      - task: check-node-dns-path
+      - task: check-nas-backup
+      - task: check-private-repo-chain
+      - task: check-credential-expiry-pairing
+      - task: generate-node-config
+      - task: validate-schemas
+      - task: render-configs
+      - task: check-backup-recipient
+      - task: check-longhorn-backup
+      - task: validate-manifests
+      - task: encrypt-secrets
+    preconditions:
+      - msg: An existing Age key interferes with the age key in this repository, rename or delete ~/.config/sops/age/keys.txt
+        sh: '! test -f ~/.config/sops/age/keys.txt'
+      - msg: File cluster.yaml not found, did you run `task init`?
+        sh: test -f {{.TEMPLATE_CONFIG_FILE}}
+      # Without this, rendering dies partway through cluster-secrets with a
+      # Python traceback and leaves a half-written kubernetes/ directory.
+      - msg: File cloudflare-tunnel.json not found — create it with `cloudflared tunnel create --credentials-file cloudflare-tunnel.json kubernetes` (see fleet-ops docs/deploy/manual.md, Stage 4)
+        sh: test -f {{.ROOT_DIR}}/cloudflare-tunnel.json
+
+  check:
+    desc: Check the rendering pipeline for dangling variables and divergent defaults
+    cmd: python3 {{.SCRIPTS_DIR}}/check-template-integrity.py {{.ROOT_DIR}}
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-template-integrity.py
+
+  check-integrity:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-template-integrity.py {{.ROOT_DIR}}
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-template-integrity.py
+
+  # Before rendering, not after: this gate stands in front of a shell the
+  # tunnel makes publicly reachable, so a missing Auth0 application or a weak
+  # ttyd credential should stop the render rather than be discovered once it is
+  # already deployed. Missing auth0.json in particular would otherwise surface
+  # as a traceback partway through cluster-secrets, leaving a half-written
+  # kubernetes/ directory behind.
+  check-claudecode-auth:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-claudecode-auth.py {{.TEMPLATE_CONFIG_FILE}}
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-claudecode-auth.py
+
+  # An appliance emitting a non-empty static pool is #10 returning: it overlaps
+  # lan-address-probe's discovered pool, Cilium disables the whole discovered
+  # pool, and every LAN name goes NXDOMAIN while the public tunnel keeps
+  # answering. The original defect was an unreachable branch, which review does
+  # not catch and no rendered artifact shows.
+  check-lb-pool-render:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-lb-pool-render.py
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-lb-pool-render.py
+
+  # Before rendering, for the same reason as check-claudecode-auth above: this
+  # stands in front of the same publicly-reachable root shell. #9 was closed by
+  # a single word -- `--reverse-proxy=false` -- and every way of undoing it
+  # renders a manifest that looks entirely plausible, including the `--trusted-ip`
+  # typo, which skips authentication rather than naming a proxy.
+  check-forwarded-header-trust:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-forwarded-header-trust.py
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-forwarded-header-trust.py
+
+  # daily-check's internal-name probe raises a LAN-wide alarm, and this flag is
+  # the only thing deciding whether it runs on a given cluster. Both ways of
+  # getting it wrong are silent: stuck `lan` alarms every morning on a healthy
+  # LAN whose nodes point at a public resolver, stuck `public` means nothing
+  # here watches the router at all. It also asserts the derived value is one a
+  # YAML parser still reads as a string — a boolean there takes daily-check's
+  # whole Secret down (ferry133/jg-base#16).
+  check-node-dns-path:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-node-dns-path.py
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-node-dns-path.py
+
+  # Off-site backups are encrypted to the cluster's own age public key, and
+  # that value is derived rather than declared — so nobody types it, and nobody
+  # notices when it comes out wrong. Two silent failures live here: an empty
+  # recipient (the CronJob refuses to upload, every night, for the life of the
+  # appliance) and a recipient that is not this cluster's key (uploads succeed
+  # and no archive can be read at restore time).
+  #
+  # Runs between render-configs and encrypt-secrets: the plaintext render is
+  # the only moment the value that actually ships can be read.
+  check-backup-recipient:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-backup-recipient.py {{.ROOT_DIR}}
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-backup-recipient.py
+
+  # Whether the Longhorn backup selector agrees with whether this cluster
+  # installs Longhorn (ferry133/jg-base#7). `cue vet` cannot close this one: it
+  # catches `longhorn_backup_target` together with an explicit
+  # `replicated_storage: false`, but not `replicated_storage` simply absent —
+  # an optional field CUE may define as true is not a conflict, and plugin.py
+  # reads cluster.yaml rather than CUE's unified value. Measured: that
+  # combination renders deploy_longhorn=False with longhorn_backup=nfs and
+  # vets clean, which applies a RecurringJob against a CRD nothing installs.
+  #
+  # After render-configs, like check-backup-recipient: the input someone meant
+  # to write and the artifact that ships are different things.
+  check-longhorn-backup:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-longhorn-backup.py {{.ROOT_DIR}}
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-longhorn-backup.py
+
+  # Whether the database extras render their NAS backup CronJob at all. Both
+  # ways of being wrong are quiet: stuck `nfs` renders a PersistentVolume with
+  # an empty nfs.server on an appliance and turns that Kustomization red
+  # (ferry133/jg-base#17); stuck `none` stops every NAS cluster's database dumps
+  # with nothing going red at all. It also asserts the derived word is one YAML
+  # still reads as a string — see the daily-check note above for what a boolean
+  # there costs.
+  check-nas-backup:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-nas-backup.py
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-nas-backup.py
+
+  # `repository_visibility: private` needs a change in jg-base as well as here,
+  # and until both exist a private cluster bootstraps successfully and then
+  # loses its credential when Helm re-renders the FluxInstance. Refusing at
+  # render time is the cheap end of that; finding out is the expensive end
+  # (`#56` cost a provisioning run).
+  check-private-repo-chain:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-private-repo-chain.py
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-private-repo-chain.py
+
+  # ferry133/jg-cluster-template#112. The pairing between a credential and its
+  # expiry is enforced at render time by plugin.py, which every user repo
+  # carries its own copy of — and that copy is the thing this guards. A repo
+  # whose plugin.py has drifted back to a version without the pairing renders
+  # happily, and nothing says so: template copies are independent and do not
+  # follow upstream on their own. Running it here means it runs in each user
+  # repo at `task configure`, against that repo's own copy, rather than only in
+  # this repo's CI where no cluster.yaml is ever visible (FO-openspec [8e8ef1]
+  # measured that gap: zero hits here, nine other checks wired, so the zero was
+  # about pairing and not about asking the wrong file).
+  check-credential-expiry-pairing:
+    internal: true
+    cmd: python3 {{.SCRIPTS_DIR}}/check-credential-expiry-pairing.py
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/check-credential-expiry-pairing.py
+
+  validate-schemas:
+    internal: true
+    cmds:
+      # Validate the merged view, not each file separately: makejinja unifies
+      # cluster.yaml and nodes.yaml into one render context, and the constraints
+      # tying provisioning_path to nodes span both files.
+      - |
+        yq eval-all '. as $item ireduce ({}; . * $item)' \
+          {{.TEMPLATE_CONFIG_FILE}} {{.TEMPLATE_NODE_CONFIG_FILE}} > {{.MERGED_CONFIG_FILE}}
+        rc=0
+        cue vet {{.MERGED_CONFIG_FILE}} \
+          {{.TEMPLATE_RESOURCES_DIR}}/cluster.schema.cue \
+          {{.TEMPLATE_RESOURCES_DIR}}/nodes.schema.cue || rc=$?
+        # Delete on the failure path too. The merged file is cluster.yaml's
+        # plaintext credentials; aborting here used to leave it in the repo
+        # root until the next successful run — i.e. for exactly as long as the
+        # operator is editing and retrying.
+        rm -f {{.MERGED_CONFIG_FILE}}
+        exit $rc
+    preconditions:
+      - test -f {{.TEMPLATE_RESOURCES_DIR}}/cluster.schema.cue
+      - test -f {{.TEMPLATE_RESOURCES_DIR}}/nodes.schema.cue
+      - which cue yq
+
+  render-configs:
+    internal: true
+    cmds:
+      - cp -n {{.ROOT_DIR}}/trello-notifier.sample.yaml {{.ROOT_DIR}}/trello-notifier.yaml 2>/dev/null || true
+      - makejinja
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    preconditions:
+      - test -f {{.TEMPLATE_DIR}}/scripts/plugin.py
+      - test -f {{.MAKEJINJA_CONFIG_FILE}}
+      - which makejinja
+
+  # `cue vet` only validates the inputs; this is the only check on what was
+  # actually rendered. Runs before encryption so Secrets are still readable —
+  # kubeconform skips them anyway. Offline it degrades to built-in schemas
+  # (-ignore-missing-schemas) rather than failing.
+  validate-manifests:
+    desc: Validate rendered Kubernetes manifests with kubeconform
+    aliases: [lint]
+    cmd: bash {{.TEMPLATE_RESOURCES_DIR}}/kubeconform.sh {{.KUBERNETES_DIR}}
+    preconditions:
+      - test -f {{.TEMPLATE_RESOURCES_DIR}}/kubeconform.sh
+      - test -d {{.KUBERNETES_DIR}}
+      - which kubeconform kustomize
+
+  # Encrypts only what actually changed. The previous form re-encrypted every
+  # file on every run: makejinja re-renders each *.sops.* as plaintext, so
+  # `sops filestatus` reported `encrypted: false` correctly, and SOPS derives a
+  # fresh data key per encryption — identical plaintext, entirely new
+  # ciphertext, ~162 lines of secret diff after a no-op `task configure`.
+  # A diff that is always there is a diff nobody reads. See the script header.
+  encrypt-secrets:
+    internal: true
+    cmds:
+      # Directories, not a file list: the previous `sh:` var produced
+      # newline-separated paths, and interpolating those into a command line
+      # makes the shell read each newline as a command separator. The script
+      # runs its own find. TALOS_DIR is included so talsecret.sops.yaml and any
+      # other Talos-side secret is covered on the manual path.
+      - bash {{.SCRIPTS_DIR}}/encrypt-secrets.sh "{{.BOOTSTRAP_DIR}}" "{{.KUBERNETES_DIR}}" "{{.TALOS_DIR}}"
+    preconditions:
+      - test -f {{.SCRIPTS_DIR}}/encrypt-secrets.sh
+      - test -f {{.SOPS_AGE_KEY_FILE}}
+      - test -f {{.ROOT_DIR}}/.sops.yaml
+      - which jq sops yq
+
+  debug:
+    desc: Gather common resources in your cluster
+    cmds:
+      - for:
+          matrix:
+            RESOURCE: [certificates, certificaterequests, gitrepositories, helmrepositories, helmreleases, httproutes, kustomizations, nodes, pods]
+        cmd: kubectl get --all-namespaces {{.ITEM.RESOURCE}}
+    preconditions:
+      - test -f {{.KUBECONFIG}}
+      - which kubectl
+
+  # NOTE: upstream's `tidy` task ("graduate from the template") was removed.
+  # A per-user cluster repo never graduates — cluster.yaml changes are re-rendered
+  # with `task configure` for the life of the cluster, so archiving templates/ and
+  # makejinja.toml would permanently break that workflow.
+
+  reset:
+    desc: Remove templated files and directories
+    prompt: Remove all templated files and directories... continue?
+    cmds:
+      - rm -rf {{.BOOTSTRAP_DIR}}
+      - rm -rf {{.KUBERNETES_DIR}}
+      - rm -rf {{.ROOT_DIR}}/.sops.yaml
