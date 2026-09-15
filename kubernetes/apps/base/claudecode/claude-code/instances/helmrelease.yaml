@@ -1,0 +1,9 @@
+# claude-code EXTRA instances only, since 2026-09-06: the default `im`
+# HelmRelease is static and lives in jg-base
+# (kubernetes/apps/base/claudecode/claude-code/im/), switched on by the
+# claude-code-im patch in flux/cluster/ks.yaml.j2. Declaring "im" here is a
+# render error (plugin.py) -- it would fight the base object over its name.
+# Use claude_instances for renamed/additional terminals (jg-jiahd's "cc") and
+# for the basic-auth instance a claudecode_auth0:false cluster needs. The
+# shared manifests (namespace, SA/RBAC, OCIRepository, secrets) come from
+# jg-base kubernetes/apps/base/claudecode.
