@@ -119,7 +119,7 @@ spec:
       target:
         group: kustomize.toolkit.fluxcd.io
         kind: Kustomization
-    # suspended: storage_backend is replicated, so there is no NAS to provision from
+    # suspended: storage_backend is local-path, so there is no NAS to provision from
     - patch: |-
         apiVersion: kustomize.toolkit.fluxcd.io/v1
         kind: Kustomization
