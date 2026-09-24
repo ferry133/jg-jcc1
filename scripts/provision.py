@@ -798,11 +798,7 @@ def cmd_template_residue(args) -> int:
         huh(f"{d} tracks no files in any subdirectory — nothing to judge")
         return UNKNOWN
 
-    # What a cluster repo legitimately holds. Anything else is residue until
-    # someone decides otherwise and adds it here, with a reason.
-    EXPECTED = {"kubernetes", "templates", "scripts", ".taskfiles", ".github",
-                "bootstrap", "talos", "flux"}
-    residue = [t for t in tops if t not in EXPECTED]
+    residue = [t for t in tops if t not in CLUSTER_REPO_TOPLEVEL]
     if not residue:
         ok(f"{d}: {len(tops)} tracked top-level directories, all expected")
         print(f"      ({', '.join(tops)})")
@@ -812,10 +808,38 @@ def cmd_template_residue(args) -> int:
     print("      Remove them before the first push. Each one is a second copy of")
     print("      a tracked record: the duplicate diverges, and the one being")
     print("      followed is usually the wrong one.")
-    print("      If one of these belongs here, add it to EXPECTED in")
-    print("      scripts/provision.py with the reason — reviewing the allowlist")
-    print("      is the point, not silencing the finding.")
+    print("      If one of these belongs here, add it to CLUSTER_REPO_TOPLEVEL")
+    print("      in scripts/provision.py with the reason — reviewing the")
+    print("      allowlist is the point, not silencing the finding.")
     return REFUSED
+
+
+#: Top-level directories a cluster repo legitimately holds, with why.
+#:
+#: Module level, not a local, so a guard can assert against it — see
+#: `scripts/tests/test_provision.py::TestClusterRepoToplevelCoversTheTemplate`.
+#: Anything not here is residue until someone adds it *with a reason*.
+#:
+#: ⚠️ **A repo made from this template inherits every tracked file**, so any
+#: directory this template tracks must be in here or `template-residue` flags a
+#: repo that was just created and has not been touched. That is what happened
+#: between 2026-09-05 and 2026-09-15: `zero-it-assets/` entered the template ten
+#: days after this list was written, and nothing tied the two together, so every
+#: new repo failed the check and the message told the operator to delete the
+#: customer's printed handout (jgct#148).
+CLUSTER_REPO_TOPLEVEL = {
+    ".github": "workflows the customer repo inherits and runs",
+    ".taskfiles": "the task definitions `task configure` uses",
+    "bootstrap": "rendered by `task configure`; not tracked in the template",
+    "flux": "Flux's own bootstrap manifests",
+    "kubernetes": "rendered by `task configure`; not tracked in the template",
+    "scripts": "provisioning, credential and delivery tooling",
+    "talos": "rendered by `task configure`; not tracked in the template",
+    "templates": "the Jinja2 sources `task configure` renders from",
+    "zero-it-assets": "images the customer's printed handout references; "
+                      "`build-zero-it-print.py` aborts if one cannot be resolved, "
+                      "so they are load-bearing, not decoration (jgct#148)",
+}
 
 
 def cloudflared_tunnels() -> tuple[list[dict] | None, str]:
@@ -1046,6 +1070,18 @@ class ConfigurePushStep(Step):
             ["task", "configure", "--yes"],
             ["scripts/delivery-check.py", "repo-hygiene", "--dir", ctx["dir"], "--deep"],
             ["git", "-C", ctx["dir"], "add", "kubernetes"],
+            # jgct#178 — between `add` and `commit`, because this is the only
+            # moment the thing about to be published exists as an object git
+            # can be asked about while there is still a step left to stop at.
+            # The `--deep` call above scans `--all` history, and the tree
+            # staged here is not on any ref yet; `commit` puts it there and
+            # `push` is the very next command. **So a scan placed after
+            # `commit` would not be too late for `push` — it would be too late
+            # for the history**: the content is permanent by then, and
+            # untracking does not unpublish. That is why this sits here and not
+            # one line down.
+            ["scripts/delivery-check.py", "repo-hygiene", "--dir", ctx["dir"],
+             "--staged"],
             ["git", "-C", ctx["dir"], "commit", "-m", "chore: rendered cluster configuration"],
             ["git", "-C", ctx["dir"], "push"],
         ]
@@ -1219,12 +1255,20 @@ def cmd_detect(args) -> int:
 def cmd_derive(args) -> int:
     """4.6 — network values read off the machine, never typed.
 
-    ⚠️ **The shape of `MachineStatusSpec.network` here was read from Omni's
-    protobuf definitions (`client/api/omni/specs/omni.proto`, §1.1's spike),
-    not observed on a live machine from this session** — the port-forward into
-    jcom that `omnictl` needs was not available while this was written. Every
-    lookup below therefore fails to UNKNOWN rather than to a default, and the
-    first real run should confirm the field names before trusting the output.
+    The shape of `MachineStatusSpec.network` was originally read from Omni's
+    protobuf definitions (`client/api/omni/specs/omni.proto`, §1.1's spike) and
+    not from a live machine, with a note here saying the first real run should
+    confirm the field names. **That run happened on 2026-09-14 (`jg-jcc1`) and
+    the note earned its keep: one of the names was wrong.** `defaultgateways`
+    is what the JSON carries; `default_gateways` is the proto name and matches
+    nothing in the reply (#152).
+
+    So the names below are now part proto-derived and part observed. The two
+    that have been seen on a live machine are `addresses` and `defaultgateways`.
+    Every lookup still fails to UNKNOWN rather than to a default, and reading a
+    key by a name the reply does not use produces exactly the same silence as a
+    machine that has not finished DHCP — which is why the absent key and the
+    empty list are now reported separately below.
     """
     rows, err = omnictl_json("machinestatus", args.machine)
     if rows is None:
@@ -1236,7 +1280,22 @@ def cmd_derive(args) -> int:
 
     net = (rows[0].get("spec") or {}).get("network") or {}
     addrs = net.get("addresses") or []
-    gws = net.get("default_gateways") or []
+    # `defaultgateways`, all lower case. NOT `default_gateways` (the proto field
+    # name, `omni.proto:130`) and NOT `defaultGateways` (the `json=` tag in the
+    # generated Go). What `omnictl get machinestatus -o json` actually emits is
+    # the lower-case form — measured 2026-09-14 against a live Omni on `jg-jcc1`,
+    # where the key was there with a value and this code read `None` (#152).
+    #
+    # Read into a sentinel, not `or []`: **"the key is not there" and "Omni says
+    # there are none" need opposite next actions**, and `or []` collapses them.
+    # That collapse is what #152 was: the wrong name produced an absent key, the
+    # absent key became `[]`, and `[]` was reported as "no default gateway
+    # reported" — a statement about Omni that was really a statement about this
+    # query. It then fell back to the template's `.1`-of-`node_cidr` guess,
+    # which is the assumption `#49` exists to have removed.
+    _GW_ABSENT = object()
+    gws_raw = net.get("defaultgateways", _GW_ABSENT)
+    gws = [] if gws_raw is _GW_ABSENT else (gws_raw or [])
     if not addrs:
         huh(f"machine {args.machine} reports no addresses "
             f"(keys present: {', '.join(sorted(net)) or 'none'})")
@@ -1267,8 +1326,22 @@ def cmd_derive(args) -> int:
         print(f"node_default_gateway: {gws[0]}")
     elif gws:
         huh(f"{len(gws)} default gateways reported: {', '.join(gws)} — pick by hand")
+    elif gws_raw is _GW_ABSENT:
+        # Not "Omni says none". This code looked for a key that is not in the
+        # reply at all, which is what reading it by the wrong name looks like.
+        huh(f"machine {args.machine} has no `defaultgateways` key in its network "
+            f"block (keys present: {', '.join(sorted(net)) or 'none'})")
+        print("      That is this command asking for something the reply does not")
+        print("      have — a question about the name, not an answer about the")
+        print("      network. Do not fall back to a default on it: check the key")
+        print("      name against `omnictl get machinestatus -o json` first (#152).")
+        return UNKNOWN
     else:
-        huh("no default gateway reported; the template's .1-of-node_cidr default applies")
+        huh("`defaultgateways` is present and empty: Omni reports no default "
+            "gateway for this machine")
+        print("      This one IS an answer, and it is the case the template's")
+        print("      .1-of-node_cidr default was written for — but it is still a")
+        print("      guess, which is what #49 removed. Confirm it on the machine.")
 
     if args.profile == "appliance":
         print()
@@ -1279,8 +1352,15 @@ def cmd_derive(args) -> int:
     else:
         print()
         print("Remaining LB/VIP addresses are a choice about the customer's LAN,")
-        print("not a fact Omni reports. Pick four unused addresses in the CIDR")
-        print("above and record which, on the ticket.")
+        print("not a fact Omni reports. Pick THREE unused addresses in the CIDR")
+        print("above -- cluster_gateway_addr, cluster_dns_gateway_addr and")
+        print("cloudflare_gateway_addr -- and record which, on the ticket.")
+        print()
+        print("NOT cluster_api_addr (jgct#188): this command only speaks to")
+        print("Omni, so the cluster it is describing is on provisioning_path")
+        print("omni, where the API is reached through the Omni proxy and that")
+        print("field has no consumer. The schema stopped requiring it there.")
+        print("It is still accepted if your cluster.yaml already has one.")
     return DONE
 
 

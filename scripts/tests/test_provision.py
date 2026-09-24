@@ -19,13 +19,17 @@ re-reading it. They are marked REGRESSION.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
 import subprocess
 import tempfile
+import types
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("prov", ROOT / "scripts" / "provision.py")
@@ -244,6 +248,38 @@ class TestHistoryLeakGuard(unittest.TestCase):
     def test_clean_history_passes(self):
         d = self.make_repo(None)
         self.assertEqual(prov.ConfigurePushStep().observe({"dir": d}).state, prov.PRESENT)
+
+    def test_the_staged_tree_is_scanned_between_add_and_commit(self):
+        """#178 — the half of that issue that does not live in delivery-check.
+
+        Nothing under `templates/` or `.taskfiles/` invokes `repo-hygiene`
+        (measured on main 2026-09-18), so the `--staged` cell added there is
+        reachable only because this step calls it. **A PR that added the cell
+        and not this call would pass every test in the other file and change
+        nothing that runs.**
+
+        The order is the assertion, not the presence: scanning after `commit`
+        would be scanning something already in history, and scanning before
+        `add` is what the issue is about.
+        """
+        cmds = prov.ConfigurePushStep().create({"dir": "/tmp/x"})
+        joined = [" ".join(c) for c in cmds]
+        # `next(..., None)` and an explicit assert, not a bare `next()`:
+        # removing the call made this raise StopIteration, which is an
+        # *errored* test, not a failing one. A guard whose red says
+        # "StopIteration" names nothing — the reader has to open the file to
+        # learn what was being checked.
+        add = next((i for i, c in enumerate(joined)
+                    if c.startswith("git -C /tmp/x add")), None)
+        commit = next((i for i, c in enumerate(joined) if "commit" in c), None)
+        staged = next((i for i, c in enumerate(joined) if "--staged" in c), None)
+        self.assertIsNotNone(add, "the step must `git add` the rendered tree")
+        self.assertIsNotNone(commit, "the step must commit it")
+        self.assertIsNotNone(
+            staged, "the step must call `repo-hygiene --staged` — without it "
+                    "the cell in delivery-check.py is reachable by nobody")
+        self.assertLess(add, staged, "the scan must come after `git add`")
+        self.assertLess(staged, commit, "and before `git commit`")
 
     def test_the_path_that_actually_leaked_is_caught(self):
         # jcom and jg-jiahd leaked at config.gen/cluster.yaml while the ignore
@@ -991,6 +1027,173 @@ class TestStepsAreWiredToTheDriver(unittest.TestCase):
         # and the operator reads that head to decide what to fix.
         tasks = [s.task for s in prov.STEPS]
         self.assertEqual(sorted(tasks), sorted(set(tasks)), f"duplicate task in {tasks}")
+
+
+
+class TestDeriveGatewayKey(unittest.TestCase):
+    """4.6 must tell "I asked the wrong thing" from "Omni says none" (jgct#152).
+
+    The defect: the code read `default_gateways` — the **proto** field name —
+    while `omnictl get machinestatus -o json` emits `defaultgateways`. The key
+    was never found, `or []` turned the miss into an empty list, and the empty
+    list was reported as *no default gateway reported*. That sentence is about
+    Omni; what had actually happened was about the query. It then applied the
+    template's `.1`-of-`node_cidr` guess, which is the assumption `#49` removed.
+
+    Both halves are asserted because either alone passes on a broken version:
+    read the right key and you still cannot tell absent from empty; split the
+    states while reading the wrong key and every machine looks "absent".
+    """
+
+    ARGS = dict(machine="m-1", domain="example.test", dir=".", profile="full")
+
+    def _derive(self, network: dict):
+        rows = [{"spec": {"network": network}}]
+        out = io.StringIO()
+        with mock.patch.object(prov, "omnictl_json", return_value=(rows, "")), \
+             contextlib.redirect_stdout(out):
+            rc = prov.cmd_derive(types.SimpleNamespace(**self.ARGS))
+        return rc, out.getvalue()
+
+    NET = {"addresses": ["10.9.9.62/24"]}
+
+    def test_the_address_guidance_asks_for_three_not_four(self):
+        """#188 condition 4 — the sentence the operator acts on.
+
+        `cmd_derive` speaks to Omni and nothing else, so the cluster it is
+        describing is always on `provisioning_path: omni` — where, since #188,
+        `cluster_api_addr` has no consumer and the schema no longer asks for
+        it. The text still said "Pick four unused addresses".
+
+        ⚠️ Asserted here rather than left to review because of the 2026-09-16
+        ruling: **when the words are what an operator acts from, they are the
+        product**. A defect that moves from the schema onto the operator's
+        screen has not been fixed — it has been relocated to where it looks
+        more authoritative, since the schema would at least have refused.
+        """
+        rc, out = self._derive({**self.NET, "defaultgateways": ["10.9.9.1"]})
+        self.assertNotIn("four unused addresses", out)
+        self.assertIn("THREE unused addresses", out)
+        # And it names which three, so "three" is not a number to guess at.
+        for field in ("cluster_gateway_addr", "cluster_dns_gateway_addr",
+                      "cloudflare_gateway_addr"):
+            with self.subTest(field=field):
+                self.assertIn(field, out)
+        # The one that is no longer asked for is named too, with its reason —
+        # otherwise the next operator re-adds it from an older ticket.
+        self.assertIn("NOT cluster_api_addr", out)
+
+    def test_the_appliance_branch_is_untouched_by_that(self):
+        """Positive control for the case above: the appliance text still
+        rejects all four, so the change is scoped to the non-appliance branch
+        and not a global rewrite of this command's output."""
+        args = dict(self.ARGS, profile="appliance")
+        out = io.StringIO()
+        with mock.patch.object(prov, "omnictl_json",
+                               return_value=([{"spec": {"network": {
+                                   **self.NET, "defaultgateways": ["10.9.9.1"]}}}], "")), \
+             contextlib.redirect_stdout(out):
+            prov.cmd_derive(types.SimpleNamespace(**args))
+        text = out.getvalue()
+        self.assertIn("profile=appliance", text)
+        self.assertIn("cluster_api_addr", text)
+        self.assertNotIn("THREE unused addresses", text)
+
+    def test_reads_the_lower_case_key_omnictl_actually_emits(self):
+        rc, out = self._derive({**self.NET, "defaultgateways": ["10.9.9.1"]})
+        self.assertIn("node_default_gateway: 10.9.9.1", out)
+
+    def test_the_proto_name_is_not_what_is_read(self):
+        # The exact shape that produced the defect: the value is there under the
+        # proto name, and this command must NOT find it — otherwise the test
+        # would pass against a version that reads both and hides the mistake.
+        rc, out = self._derive({**self.NET, "default_gateways": ["10.9.9.1"]})
+        self.assertNotIn("node_default_gateway: 10.9.9.1", out)
+        self.assertIn("no `defaultgateways` key", out)
+
+    def test_key_absent_is_a_question_about_the_name(self):
+        rc, out = self._derive(self.NET)
+        self.assertEqual(rc, prov.UNKNOWN)
+        self.assertIn("no `defaultgateways` key", out)
+        self.assertNotIn("Omni reports no default gateway", out)
+        # And it must not send the reader to the .1 default.
+        self.assertNotIn(".1-of-node_cidr", out)
+
+    def test_key_present_and_empty_is_an_answer_from_omni(self):
+        rc, out = self._derive({**self.NET, "defaultgateways": []})
+        self.assertIn("Omni reports no default gateway", out)
+        self.assertNotIn("no `defaultgateways` key", out)
+
+    def test_the_two_empty_cases_do_not_print_the_same_thing(self):
+        # NEGATIVE CONTROL for the split itself. Collapsing them is the defect,
+        # and a version that reports both the same way passes every test above
+        # that only checks one of them.
+        _, absent = self._derive(self.NET)
+        _, empty = self._derive({**self.NET, "defaultgateways": []})
+        self.assertNotEqual(absent, empty)
+
+
+
+class TestClusterRepoToplevelCoversTheTemplate(unittest.TestCase):
+    """Every directory THIS repo tracks must be in `CLUSTER_REPO_TOPLEVEL`.
+
+    A repo made from this template inherits every tracked file, so the moment
+    this template tracks a directory the allowlist does not name,
+    `provision.py template-residue` fails on a repo that was just created and
+    has not been touched — and its message tells the operator to delete it.
+
+    That is not hypothetical (jgct#148): the allowlist was written 2026-08-26,
+    `zero-it-assets/` entered the template 2026-09-05, **and nothing tied the
+    two together**. Every new customer repo failed the check for ten days, and
+    the deletion it advised would have removed the images the customer's
+    printed handout references. It surfaced only on a real delivery.
+
+    So the tie is written here, where CI runs it: **this is the check that
+    should have gone red on 2026-09-05 instead of a person going red on
+    2026-09-15.**
+
+    ⚠️ Only one direction is asserted. `CLUSTER_REPO_TOPLEVEL` legitimately
+    holds names this template does not track — `kubernetes`, `bootstrap` and
+    `talos` are rendered by `task configure` and appear only in the customer's
+    repo. A superset is expected; a **subset** is the defect.
+    """
+
+    def _template_toplevel(self) -> set[str]:
+        # Same shape as `template-residue`: directories, from tracked paths.
+        r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "HEAD"],
+                           cwd=str(ROOT), capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        tops = {p.split("/", 1)[0] for p in r.stdout.splitlines() if "/" in p}
+        # Positive control: if this ever comes back empty the assertion below
+        # passes vacuously, and an empty set is what a broken query looks like.
+        self.assertIn("scripts", tops, "git ls-tree returned nothing usable")
+        return tops
+
+    def test_the_template_tracks_nothing_the_allowlist_omits(self):
+        tops = self._template_toplevel()
+        missing = sorted(tops - set(prov.CLUSTER_REPO_TOPLEVEL))
+        self.longMessage = False
+        self.assertEqual(
+            missing, [],
+            "\n"
+            f"This template tracks top-level director{'y' if len(missing)==1 else 'ies'} "
+            f"that CLUSTER_REPO_TOPLEVEL does not name: {', '.join(missing)}\n"
+            "\n"
+            "  Every repo created from this template inherits them, so\n"
+            "  `provision.py template-residue` will fail on a brand-new repo and\n"
+            "  tell the operator to delete them.\n"
+            "\n"
+            "  If the directory belongs in a cluster repo: add it to\n"
+            "  CLUSTER_REPO_TOPLEVEL in scripts/provision.py **with its reason**.\n"
+            "  If it does not belong in a cluster repo: it should not be tracked\n"
+            "  in the template either, because the template is what makes them.\n",
+        )
+
+    def test_every_entry_carries_a_reason(self):
+        # The allowlist is a dict so that adding a name costs a sentence. An
+        # empty reason turns it back into a set that anyone can grow silently.
+        blank = sorted(k for k, v in prov.CLUSTER_REPO_TOPLEVEL.items() if not v.strip())
+        self.assertEqual(blank, [], f"no reason given for: {blank}")
 
 
 if __name__ == "__main__":
