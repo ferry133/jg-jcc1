@@ -158,19 +158,6 @@ spec:
         group: kustomize.toolkit.fluxcd.io
         kind: Kustomization
         name: lan-address-probe
-    # suspended: single-node cluster: a peer-to-peer image mirror has no peers
-    - patch: |-
-        apiVersion: kustomize.toolkit.fluxcd.io/v1
-        kind: Kustomization
-        metadata:
-          name: spegel
-          namespace: flux-system
-        spec:
-          suspend: true
-      target:
-        group: kustomize.toolkit.fluxcd.io
-        kind: Kustomization
-        name: spegel
     # disabled (empty path, so anything previously applied is pruned): no longhorn_backup_target: an empty path so Flux prunes the RecurringJob, rather than a suspend that would strand it
     - patch: |-
         apiVersion: kustomize.toolkit.fluxcd.io/v1
@@ -213,22 +200,6 @@ spec:
         group: kustomize.toolkit.fluxcd.io
         kind: Kustomization
         name: claudecode-db
-    # single node: one envoy replica per gateway, not two
-    - patch: |-
-        - op: add
-          path: /spec/patches/-
-          value:
-            patch: |-
-              - op: replace
-                path: /spec/provider/kubernetes/envoyDeployment/replicas
-                value: 1
-            target:
-              group: gateway.envoyproxy.io
-              kind: EnvoyProxy
-      target:
-        group: kustomize.toolkit.fluxcd.io
-        kind: Kustomization
-        name: envoy-gateway
 ---
 # ── claude-code instances (base; per-cluster rendered from claude_instances) ──
 # The shared pieces (namespace, SA/RBAC, OCIRepository, secrets) come from
